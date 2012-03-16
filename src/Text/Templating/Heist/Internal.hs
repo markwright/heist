@@ -22,6 +22,7 @@ import             Data.Either
 import qualified   Data.Foldable as F
 import             Data.List
 import qualified   Data.HashMap.Strict as Map
+import             Data.HashMap.Strict (HashMap)
 import             Data.Maybe
 import             Data.Monoid
 import qualified   Data.Text as T
@@ -33,6 +34,12 @@ import qualified   Text.XmlHtml as X
 
 ------------------------------------------------------------------------------
 import             Text.Templating.Heist.Types
+
+
+------------------------------------------------------------------------------
+-- | The maximum recursion depth.  (Used to prevent infinite loops.)
+mAX_RECURSION_DEPTH :: Int
+mAX_RECURSION_DEPTH = 50
 
 
 -- ------------------------------------------------------------------------------
@@ -302,124 +309,10 @@ import             Text.Templating.Heist.Types
 -- 
 -- 
 -- ------------------------------------------------------------------------------
--- -- | Performs splice processing on a single node.
--- runNode :: Monad m => X.Node -> Splice m
--- runNode (X.Element nm at ch) = do
---     newAtts <- mapM attSubst at
---     let n = X.Element nm newAtts ch
---     s <- liftM (lookupSplice nm) getTS
---     maybe (runKids newAtts) (recurseSplice n) s
---   where
---     runKids newAtts = do
---         newKids <- runNodeList ch
---         return [X.Element nm newAtts newKids]
--- runNode n                    = return [n]
--- 
--- 
--- ------------------------------------------------------------------------------
--- -- | Helper function for substituting a parsed attribute into an attribute
--- -- tuple.
--- attSubst :: (Monad m) => (t, Text) -> SpliceT m (t, Text)
--- attSubst (n,v) = do
---     v' <- parseAtt v
---     return (n,v')
--- 
--- 
--- ------------------------------------------------------------------------------
--- -- | Parses an attribute for any identifier expressions and performs
--- -- appropriate substitution.
--- parseAtt :: (Monad m) => Text -> SpliceT m Text
--- parseAtt bs = do
---     let ast = case AP.feed (AP.parse attParser bs) "" of
---                 (AP.Done _ res) -> res
---                 (AP.Fail _ _ _) -> []
---                 (AP.Partial _)  -> []
---     chunks <- mapM cvt ast
---     return $ T.concat chunks
---   where
---     cvt (Literal x) = return x
---     cvt (Ident x)   =
---         localParamNode (const $ X.Element x [] []) $ getAttributeSplice x
--- 
--- 
--- ------------------------------------------------------------------------------
--- -- | AST to hold attribute parsing structure.  This is necessary because
--- -- attoparsec doesn't support parsers running in another monad.
--- data AttAST = Literal Text
---             | Ident   Text
---   deriving (Show)
--- 
--- 
--- ------------------------------------------------------------------------------
--- -- | Parser for attribute variable substitution.
--- attParser :: AP.Parser [AttAST]
--- attParser = liftM ($! []) (loop id)
---   where
---     append !dl !x = dl . (x:)
--- 
---     loop !dl = go id
---       where
---         finish subDL = let !txt = T.concat $! subDL []
---                            lit  = Literal $! T.concat $! subDL []
---                        in return $! if T.null txt
---                                       then dl
---                                       else append dl lit
--- 
---         go !subDL = (gobbleText >>= go . append subDL)
---                     <|> (AP.endOfInput *> finish subDL)
---                     <|> (escChar >>= go . append subDL)
---                     <|> (do
---                             idp <- identParser
---                             dl' <- finish subDL
---                             loop $! append dl' idp)
--- 
---     gobbleText = AP.takeWhile1 (AP.notInClass "\\$")
--- 
---     escChar = AP.char '\\' *> (T.singleton <$> AP.anyChar)
--- 
---     identParser = AP.char '$' *> (ident <|> return (Literal "$"))
---     ident = (AP.char '{' *> (Ident <$> AP.takeWhile (/='}')) <* AP.string "}")
--- 
--- 
--- ------------------------------------------------------------------------------
--- -- | Gets the attribute value.  If the splice's result list contains non-text
--- -- nodes, this will translate them into text nodes with nodeText and
--- -- concatenate them together.
--- --
--- -- Originally, this only took the first node from the splices's result list,
--- -- and only if it was a text node. This caused problems when the splice's
--- -- result contained HTML entities, as they would split a text node. This was
--- -- then fixed to take the first consecutive bunch of text nodes, and return
--- -- their concatenation. This was seen as more useful than throwing an error,
--- -- and more intuitive than trying to render all the nodes as text.
--- --
--- -- However, it was decided in the end to render all the nodes as text, and
--- -- then concatenate them. If a splice returned
--- -- \"some \<b\>text\<\/b\> foobar\", the user would almost certainly want
--- -- \"some text foobar\" to be rendered, and Heist would probably seem
--- -- annoyingly limited for not being able to do this. If the user really did
--- -- want it to render \"some \", it would probably be easier for them to
--- -- accept that they were silly to pass more than that to be substituted than
--- -- it would be for the former user to accept that
--- -- \"some \<b\>text\<\/b\> foobar\" is being rendered as \"some \" because
--- -- it's \"more intuitive\".
--- getAttributeSplice :: Monad m => Text -> SpliceT m Text
--- getAttributeSplice name = do
---     s <- liftM (lookupSplice name) getTS
---     nodes <- maybe (return []) id s
---     return $ T.concat $ map X.nodeText nodes
--- 
--- ------------------------------------------------------------------------------
 -- -- | Performs splice processing on a list of nodes.
 -- runNodeList :: Monad m => [X.Node] -> Splice m
 -- runNodeList = mapSplices runNode
 -- {-# INLINE runNodeList #-}
--- 
--- 
--- ------------------------------------------------------------------------------
--- -- | The maximum recursion depth.  (Used to prevent infinite loops.)
--- mAX_RECURSION_DEPTH :: Int
--- mAX_RECURSION_DEPTH = 50
 -- 
 -- 
 -- ------------------------------------------------------------------------------
@@ -645,6 +538,41 @@ getXMLDoc :: String -> IO (Either String DocumentFile)
 getXMLDoc = getDocWith X.parseHTML
 
 
+-- ------------------------------------------------------------------------------
+-- -- | Runs a template modifying function on a DocumentFile.
+-- runHook :: Monad m => (Template -> m Template)
+--         -> DocumentFile
+--         -> m DocumentFile
+-- runHook f t = do
+--     n <- f $ X.docContent $ dfDoc t
+--     return $ t { dfDoc = (dfDoc t) { X.docContent = n } }
+-- 
+-- 
+-- ------------------------------------------------------------------------------
+-- -- | Runs the onLoad hook on the template and returns the 'HeistState'
+-- -- with the result inserted.
+-- loadHook :: Monad m => HeistState m -> (TPath, DocumentFile)
+--          -> IO (HeistState m)
+-- loadHook ts (tp, t) = do
+--     t' <- runHook (_onLoadHook ts) t
+--     return $ insertTemplate tp t' ts
+
+
+------------------------------------------------------------------------------
+-- | Adds a path prefix to all the templates in the 'HeistState'.  If you
+-- want to add multiple levels of directories, separate them with slashes as
+-- in "foo/bar".  Using an empty string as a path prefix will leave the
+-- 'HeistState' unchanged.
+addTemplatePathPrefix :: ByteString -> HeistState m a -> HeistState m a
+addTemplatePathPrefix dir ts
+  | B.null dir = ts
+  | otherwise  = ts { _templateMap = Map.fromList $
+                                     map (\(x,y) -> (f x, y)) $
+                                     Map.toList $
+                                     _templateMap ts
+                    }
+  where
+    f ps = ps++splitTemplatePath dir
 ------------------------------------------------------------------------------
 -- | Loads a template with the specified path and filename.  The
 -- template is only loaded if it has a ".tpl" or ".xtpl" extension.
@@ -672,8 +600,12 @@ loadTemplate templateRoot fname
 ------------------------------------------------------------------------------
 -- | Traverses the specified directory structure and builds a HeistState by
 -- loading all the files with a ".tpl" or ".xtpl" extension.
-loadTemplates :: Monad m => FilePath -> HeistState m
-              -> IO (Either String (HeistState m))
+loadTemplates :: Monad m
+              => FilePath
+              -- ^ Path to the template directory
+              -> HeistState m a
+              -- ^ Map of splices
+              -> IO (Either String (HeistState m a))
 loadTemplates dir ts = do
     d <- readDirectoryWith (loadTemplate dir) dir
     let tlist = F.fold (free d)
@@ -684,42 +616,27 @@ loadTemplates dir ts = do
         _  -> return $ Left $ unlines errs
 
 
-compileTemplates = undefined
+type HeistInit m out a = StateT (HeistState m out) IO a
 
+compileTemplate :: (TPath, DocumentFile)
+                -> HeistInit m out a
+compileTemplates (tp,df) = do
+    
 
--- ------------------------------------------------------------------------------
--- -- | Runs a template modifying function on a DocumentFile.
--- runHook :: Monad m => (Template -> m Template)
---         -> DocumentFile
---         -> m DocumentFile
--- runHook f t = do
---     n <- f $ X.docContent $ dfDoc t
---     return $ t { dfDoc = (dfDoc t) { X.docContent = n } }
--- 
--- 
--- ------------------------------------------------------------------------------
--- -- | Runs the onLoad hook on the template and returns the 'HeistState'
--- -- with the result inserted.
--- loadHook :: Monad m => HeistState m -> (TPath, DocumentFile)
---          -> IO (HeistState m)
--- loadHook ts (tp, t) = do
---     t' <- runHook (_onLoadHook ts) t
---     return $ insertTemplate tp t' ts
 
 
 ------------------------------------------------------------------------------
--- | Adds a path prefix to all the templates in the 'HeistState'.  If you
--- want to add multiple levels of directories, separate them with slashes as
--- in "foo/bar".  Using an empty string as a path prefix will leave the
--- 'HeistState' unchanged.
-addTemplatePathPrefix :: ByteString -> HeistState m -> HeistState m
-addTemplatePathPrefix dir ts
-  | B.null dir = ts
-  | otherwise  = ts { _templateMap = Map.fromList $
-                                     map (\(x,y) -> (f x, y)) $
-                                     Map.toList $
-                                     _templateMap ts
-                    }
+-- | Performs splice processing on a single node.
+runNode :: Monad m => X.Node -> HeistInit m out (m out)
+runNode (X.Element nm at ch) = do
+--    newAtts <- mapM attSubst at
+--    let n = X.Element nm newAtts ch
+    s <- liftM (lookupSplice nm) getTS
+    maybe (runKids newAtts) (recurseSplice n) s
   where
-    f ps = ps++splitTemplatePath dir
+    runKids newAtts = do
+        newKids <- runNodeList ch
+        return [X.Element nm newAtts newKids]
+runNode n                    = return [n]
+
 

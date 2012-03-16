@@ -70,13 +70,8 @@ type TemplateMap = HashMap TPath DocumentFile
 
 
 ------------------------------------------------------------------------------
--- | A Splice is a SpliceT computation that returns a 'Template'.
-type Splice m = SpliceT m Template
-
-
-------------------------------------------------------------------------------
 -- | SpliceMap associates a name and a Splice.
-type SpliceMap m = HashMap Text (Splice m)
+type SpliceMap m out = HashMap Text (SpliceT m out)
 
 
 ------------------------------------------------------------------------------
@@ -84,13 +79,15 @@ type SpliceMap m = HashMap Text (Splice m)
 -- The idea is that adjacent pure chunks can be consolidated. We also want
 -- to left fold over a series of 'yield' and 'actLater' actions as efficiently
 -- as possible.
-data OutputChunk c m = Pure !c
-                     | Act !c !(m c) !c
-                     -- ^ An action with optional pure prefix and suffix
+data OutputChunk out m = Pure !out
+                       | Act !out !(m out) !out
+                       -- ^ An action with optional pure prefix and suffix
+                       -- Not sure if the prefix and suffix are useful or not
+                       -- but we'll keep them for now until it becomes clear
 
 
 ------------------------------------------------------------------------------
-(~>) :: (Monoid c, Monad m) => m c -> m c -> m c
+(~>) :: (Monoid out, Monad m) => m out -> m out -> m out
 (~>) m n = do
     !a <- m
     !b <- n
@@ -100,15 +97,15 @@ infixl 3 ~>
 
 
 ------------------------------------------------------------------------------
-instance (Monoid c, Monad m) => Monoid (OutputChunk c m) where
+instance (Monoid out, Monad m) => Monoid (OutputChunk out m) where
     mempty  = Pure mempty
     mconcat = foldl' mappend mempty
 
-    (Pure a   ) `mappend` (Pure b   ) = Pure (a `mappend` b)
-    (Pure a   ) `mappend` (Act b m c) = Act  (a `mappend` b) m c
-    (Act a m b) `mappend` (Pure c   ) = Act  a m (b `mappend` c)
-    (Act a m b) `mappend` (Act c n d) =
-        Act a (m ~> return (b `mappend` c) ~> n) d
+    (Pure a   ) `mappend` (Pure b     ) = Pure (a `mappend` b)
+    (Pure a   ) `mappend` (Act b m out) = Act  (a `mappend` b) m out
+    (Act a m b) `mappend` (Pure out   ) = Act  a m (b `mappend` out)
+    (Act a m b) `mappend` (Act out n d) =
+        Act a (m ~> return (b `mappend` out) ~> n) d
 
 
 ------------------------------------------------------------------------------
@@ -116,9 +113,9 @@ instance (Monoid c, Monad m) => Monoid (OutputChunk c m) where
 -- build a @HeistState@ using any of Heist's @HeistState m -> HeistState m@
 -- \"filter\" functions.  Then you use the resulting @HeistState@ in calls to
 -- @renderTemplate@.
-data HeistState m = HeistState {
+data HeistState m a = HeistState {
     -- | A mapping of splice names to splice actions
-      _spliceMap       :: SpliceMap m
+      _spliceMap       :: SpliceMap m a
     -- | A mapping of template names to templates
     , _templateMap     :: TemplateMap
     -- | The doctypes encountered during template processing.
@@ -140,7 +137,6 @@ data SpliceState = SpliceState {
     -- | A flag to control splice recursion
     -- FIXME Probably not needed in caper
       _recurse         :: Bool
-    , _spliceNode      :: X.Node
     -- | The path to the template currently being processed.
     , _curContext      :: TPath
     -- | A counter keeping track of the current recursion depth to prevent
@@ -148,45 +144,12 @@ data SpliceState = SpliceState {
     , _recursionDepth  :: Int
     -- | The full path to the current template's file on disk.
     , _curTemplateFile :: Maybe FilePath
+    , _spliceNode      :: X.Node
 }
 
 
 ------------------------------------------------------------------------------
--- | Gets the names of all the templates defined in a HeistState.
-templateNames :: HeistState m -> [TPath]
-templateNames ts = H.keys $ _templateMap ts
-
-
-------------------------------------------------------------------------------
--- | Gets the names of all the splices defined in a HeistState.
-spliceNames :: HeistState m -> [Text]
-spliceNames ts = H.keys $ _spliceMap ts
-
-
-------------------------------------------------------------------------------
-instance (Monad m) => Monoid (HeistState m) where
-    mempty = HeistState H.empty H.empty []
-
-    (HeistState s1 t1 dt1) `mappend` (HeistState s2 t2 dt2) =
-        HeistState s t (dt1 `mappend` dt2)
-      where
-        s = s1 `mappend` s2
-        t = t1 `mappend` t2
-
-
-------------------------------------------------------------------------------
--- | The Typeable instance is here so Heist can be dynamically executed with
--- Hint.
-templateStateTyCon :: TyCon
-templateStateTyCon = mkTyCon "Text.Templating.Heist.HeistState"
-{-# NOINLINE templateStateTyCon #-}
-
-instance (Typeable1 m) => Typeable (HeistState m) where
-    typeOf _ = mkTyConApp templateStateTyCon [typeOf1 (undefined :: m ())]
-
-
-------------------------------------------------------------------------------
--- | SpliceT is the monad used for 'Splice' processing.  SpliceT provides
+-- | SpliceT is the monad used for splice processing.  SpliceT provides
 -- \"passthrough\" instances for many of the monads you might use in the inner
 -- monad.
 newtype SpliceT m a = SpliceT {
@@ -214,10 +177,46 @@ runSpliceT = runStateT . unSpliceT
 -- | Evaluates a template monad as a computation in the underlying monad.
 evalSpliceT :: Monad m
            => SpliceT m a
-           -> SpliceState
+           -> X.Node
            -> m a
-evalSpliceT m = evalStateT (unSpliceT m)
+evalSpliceT m node = evalStateT (unSpliceT m) $
+    SpliceState False [] 0 Nothing node
+
 {-# INLINE evalSpliceT #-}
+
+
+------------------------------------------------------------------------------
+-- | Gets the names of all the templates defined in a HeistState.
+templateNames :: HeistState m a -> [TPath]
+templateNames ts = H.keys $ _templateMap ts
+
+
+------------------------------------------------------------------------------
+-- | Gets the names of all the splices defined in a HeistState.
+spliceNames :: HeistState m a -> [Text]
+spliceNames ts = H.keys $ _spliceMap ts
+
+
+------------------------------------------------------------------------------
+instance (Monad m) => Monoid (HeistState m a) where
+    mempty = HeistState H.empty H.empty []
+
+    (HeistState s1 t1 dt1) `mappend` (HeistState s2 t2 dt2) =
+        HeistState s t (dt1 `mappend` dt2)
+      where
+        s = s1 `mappend` s2
+        t = t1 `mappend` t2
+
+
+------------------------------------------------------------------------------
+-- | The Typeable instance is here so Heist can be dynamically executed with
+-- Hint.
+templateStateTyCon :: TyCon
+templateStateTyCon = mkTyCon "Text.Templating.Heist.HeistState"
+{-# NOINLINE templateStateTyCon #-}
+
+instance (Typeable1 m) => Typeable (HeistState m a) where
+    typeOf _ = mkTyConApp templateStateTyCon [typeOf1 (undefined :: m ())]
 
 
 ------------------------------------------------------------------------------
